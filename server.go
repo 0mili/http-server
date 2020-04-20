@@ -1,0 +1,152 @@
+// Package milihttp contains an HTTP server integrations for the mili bot library
+// https://github.com/0mili/mili
+package milihttp
+
+import (
+	"context"
+	"io/ioutil"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/0mili/mili"
+	"go.uber.org/zap"
+)
+
+// RequestEvent corresponds to an HTTP request that was received by the server.
+type RequestEvent struct {
+	Header     http.Header
+	Method     string
+	URL        *url.URL
+	RemoteAddr string
+	Body       []byte
+}
+
+type server struct {
+	http   *http.Server
+	logger *zap.Logger
+	conf   config
+	events mili.EventEmitter
+}
+
+// Server returns a mili Module that runs an HTTP server to receive HTTP requests
+// and emit them as events. This Module is mainly meant to be used to integrate
+// a Bot with other systems that send events via HTTP (e.g. pull requests on GitHub).
+func Server(path string, opts ...Option) mili.Module {
+	return mili.ModuleFunc(func(miliConf *mili.Config) error {
+		conf, err := newConf(path, miliConf, opts)
+		if err != nil {
+			return err
+		}
+
+		events := miliConf.EventEmitter()
+		server := newServer(conf, events)
+
+		server.logger.Info("Starting HTTP server", zap.String("addr", server.http.Addr))
+		started := make(chan bool)
+		go func() {
+			started <- true
+			server.Run()
+		}()
+
+		<-started
+
+		miliConf.RegisterHandler(func(mili.ShutdownEvent) {
+			server.Shutdown()
+		})
+
+		return nil
+	})
+}
+
+func newServer(conf config, events mili.EventEmitter) *server {
+	srv := &server{
+		logger: conf.logger,
+		events: events,
+		conf:   conf,
+	}
+
+	srv.http = &http.Server{
+		Addr:         conf.listenAddr,
+		Handler:      http.HandlerFunc(srv.HTTPHandler),
+		ErrorLog:     zap.NewStdLog(conf.logger),
+		TLSConfig:    conf.tlsConf,
+		ReadTimeout:  conf.readTimeout,
+		WriteTimeout: conf.writeTimeout,
+	}
+
+	return srv
+}
+
+// Run starts the HTTP server to handle any incoming requests on the listen
+// address that was configured.
+func (s *server) Run() {
+	var err error
+	if s.conf.certFile == "" {
+		err = s.http.ListenAndServe()
+	} else {
+		err = s.http.ListenAndServeTLS(s.conf.certFile, s.conf.keyFile)
+	}
+
+	if err != nil && err != http.ErrServerClosed {
+		s.logger.Error("Failed to listen and serve requests", zap.Error(err))
+	}
+}
+
+// HTTPHandler receives any incoming requests and emits them as events to the
+// bots Brain.
+func (s *server) HTTPHandler(_ http.ResponseWriter, r *http.Request) {
+	clientIP := s.clientAddress(r)
+	s.logger.Debug("Received HTTP request",
+		zap.String("method", r.Method),
+		zap.Stringer("url", r.URL),
+		zap.String("remote_addr", clientIP),
+	)
+
+	event := RequestEvent{
+		Header:     r.Header,
+		Method:     r.Method,
+		URL:        r.URL,
+		RemoteAddr: clientIP,
+	}
+
+	var err error
+	if r.Body != nil {
+		event.Body, err = ioutil.ReadAll(r.Body)
+		if err != nil {
+			s.logger.Error("Failed to read request body")
+		}
+	}
+
+	s.events.Emit(event)
+}
+
+// Shutdown gracefully shuts down the HTTP server without interrupting any
+// active connections.
+func (s *server) Shutdown() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	s.logger.Info("HTTP server is shutting down gracefully")
+	err := s.http.Shutdown(ctx)
+	if err != nil {
+		s.logger.Error("Failed to shutdown server", zap.Error(err))
+	}
+}
+
+func (s *server) clientAddress(req *http.Request) string {
+	rip, _, err := net.SplitHostPort(req.RemoteAddr)
+	if err != nil {
+		s.logger.Error("Error parsing RemoteAddr", zap.String("RemoteAddr", req.RemoteAddr))
+		return req.RemoteAddr
+	}
+	ips := req.Header.Get(s.conf.trustedHeader)
+	if ips == "" {
+		return rip
+	}
+	// The n parameter for SplitN is the number of substrings, not how many
+	// to split.
+	return strings.SplitN(ips, ", ", 2)[0]
+}
